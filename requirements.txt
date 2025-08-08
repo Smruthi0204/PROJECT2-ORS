@@ -6,5 +6,4 @@ faiss-cpu==1.7.4
 sentence-transformers==2.7.0
 httpx==0.27.0
 requests==2.32.3
-email6==0.1.1  # fallback email parser (optional)
 python-multipart==0.0.9
