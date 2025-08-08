@@ -5,28 +5,31 @@ import fitz  # PyMuPDF
 import docx
 import requests
 import tempfile
-import faiss
 import json
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 from email import message_from_string
-from sentence_transformers import SentenceTransformer
-import numpy as np
 import httpx
+import chromadb
+from chromadb.utils import embedding_functions
 
 ### CONFIGURATION
-LLM_API_URL = "http://localhost:1234/v1/completions"  # Example: LM Studio / Mistral
-LLM_API_KEY = "none"  # No key needed for open source LM Studio API
-EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+LLM_API_URL = "http://localhost:1234/v1/completions"
+LLM_API_KEY = "none"
 
-### FASTAPI INIT
-app = FastAPI(
-    title="LLM-Powered Clause Retrieval System",
-    version="1.0"
+### INIT CHROMA DB
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(
+    name="documents",
+    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    )
 )
 
+### FASTAPI INIT
+app = FastAPI(title="LLM Clause Retrieval", version="1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,109 +37,93 @@ app.add_middleware(
     allow_methods=["*"]
 )
 
-### INPUT SCHEMA
+### REQUEST SCHEMA
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
 
-### HELPER: Parse PDFs
-def parse_pdf(file_path: str) -> str:
-    doc = fitz.open(file_path)
-    return "\n".join([page.get_text() for page in doc])
+### DOCUMENT PARSERS
+def parse_pdf(path: str) -> str:
+    doc = fitz.open(path)
+    return "\n".join([p.get_text() for p in doc])
 
-### HELPER: Parse DOCX
-def parse_docx(file_path: str) -> str:
-    doc = docx.Document(file_path)
+def parse_docx(path: str) -> str:
+    doc = docx.Document(path)
     return "\n".join([para.text for para in doc.paragraphs])
 
-### HELPER: Parse Emails
-def parse_email(content: str) -> str:
-    msg = message_from_string(content)
-    parts = []
-    for part in msg.walk():
-        if part.get_content_type() == "text/plain":
-            parts.append(part.get_payload(decode=True).decode(errors='ignore'))
-    return "\n".join(parts)
+def parse_email(raw: str) -> str:
+    msg = message_from_string(raw)
+    return "\n".join(part.get_payload(decode=True).decode(errors='ignore')
+                     for part in msg.walk() if part.get_content_type() == "text/plain")
 
-### DOWNLOAD AND PARSE DOCUMENT FROM URL
 def fetch_and_parse_document(url: str) -> str:
     response = requests.get(url)
     if response.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch document")
-    
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(response.content)
-        tmp_file_path = tmp_file.name
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
 
     if url.endswith(".pdf"):
-        return parse_pdf(tmp_file_path)
+        return parse_pdf(tmp_path)
     elif url.endswith(".docx"):
-        return parse_docx(tmp_file_path)
+        return parse_docx(tmp_path)
     elif url.endswith(".eml") or url.endswith(".msg"):
         return parse_email(response.text)
     else:
         raise HTTPException(status_code=400, detail="Unsupported file type")
 
-### SPLIT DOCUMENT TO CHUNKS
+### CHUNKING
 def chunk_text(text: str, chunk_size: int = 300) -> List[str]:
-    sentences = text.split(". ")
-    chunks = []
-    current = ""
-    for sentence in sentences:
-        if len(current) + len(sentence) < chunk_size:
-            current += sentence + ". "
+    sents = text.split(". ")
+    chunks, current = [], ""
+    for sent in sents:
+        if len(current) + len(sent) < chunk_size:
+            current += sent + ". "
         else:
             chunks.append(current.strip())
-            current = sentence + ". "
+            current = sent + ". "
     if current:
         chunks.append(current.strip())
     return chunks
 
-### CREATE FAISS INDEX
-def create_faiss_index(chunks: List[str]):
-    embeddings = EMBED_MODEL.encode(chunks)
-    dimension = embeddings[0].shape[0]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(np.array(embeddings))
-    return index, embeddings, chunks
+def insert_chunks(chunks: List[str]):
+    for i, chunk in enumerate(chunks):
+        collection.add(documents=[chunk], ids=[f"chunk-{i}"])
 
-### QUERY FAISS INDEX
-def query_faiss_index(question: str, index, chunks: List[str], embeddings, k=5):
-    q_embedding = EMBED_MODEL.encode([question])[0]
-    distances, indices = index.search(np.array([q_embedding]), k)
-    return [chunks[i] for i in indices[0]]
+def query_chunks(question: str, k: int = 5) -> List[str]:
+    result = collection.query(query_texts=[question], n_results=k)
+    return result["documents"][0]
 
-### LLM INFERENCE
-async def call_llm(prompt: str) -> str:
-    headers = {
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "mistral",  # or any model hosted
-        "prompt": prompt,
-        "max_tokens": 512,
-        "temperature": 0.2
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(LLM_API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()["choices"][0]["text"].strip()
-
-### BUILD PROMPT
+### PROMPTING & LLM
 def build_prompt(question: str, context: List[str]) -> str:
-    context_str = "\n---\n".join(context)
+    ctx = "\n---\n".join(context)
     return f"""
-You are an intelligent insurance policy assistant. Use the below context to answer the question.
+You are an insurance policy assistant. Use the context below to answer the user query.
 
 Context:
-{context_str}
+{ctx}
 
 Question:
 {question}
 
-Explain the reasoning and return a JSON response with the final answer as:
-{{"answer": "<response here>"}}
+Respond with this format:
+{{"answer": "<your concise, explainable answer>"}}
 """
+
+async def call_llm(prompt: str) -> str:
+    payload = {
+        "model": "mistral",
+        "prompt": prompt,
+        "max_tokens": 512,
+        "temperature": 0.2
+    }
+    headers = {"Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(LLM_API_URL, json=payload, headers=headers)
+        res.raise_for_status()
+        return res.json()["choices"][0]["text"].strip()
 
 ### API ROUTE
 @app.post("/api/v1/hackrx/run")
@@ -144,25 +131,22 @@ async def run_query(req: QueryRequest):
     try:
         full_text = fetch_and_parse_document(req.documents)
         chunks = chunk_text(full_text)
-        index, embeddings, chunk_texts = create_faiss_index(chunks)
-        
+        insert_chunks(chunks)
+
         final_answers = []
         for question in req.questions:
-            top_chunks = query_faiss_index(question, index, chunk_texts, embeddings)
+            top_chunks = query_chunks(question)
             prompt = build_prompt(question, top_chunks)
             response_text = await call_llm(prompt)
-            
-            # Try parsing out answer from JSON
             try:
                 response_json = json.loads(response_text)
                 final_answers.append(response_json["answer"])
             except:
                 final_answers.append("Could not extract answer. Raw: " + response_text)
-        
+
         return {"answers": final_answers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 ### MAIN
 if __name__ == "__main__":
