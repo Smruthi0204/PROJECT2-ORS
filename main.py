@@ -1,7 +1,7 @@
 # main.py
 import os
 import uvicorn
-import fitz  # PyMuPDF
+import fitz
 import docx
 import requests
 import tempfile
@@ -12,142 +12,127 @@ from pydantic import BaseModel
 from typing import List
 from email import message_from_string
 import httpx
-import chromadb
-from chromadb.utils import embedding_functions
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
-### CONFIGURATION
+# --- CONFIG ---
 LLM_API_URL = "http://localhost:1234/v1/completions"
 LLM_API_KEY = "none"
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-### INIT CHROMA DB
-chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(
-    name="documents",
-    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+# --- VECTOR DB INIT ---
+client = QdrantClient(":memory:")
+COLLECTION = "docs"
+DIM = 384  # all-MiniLM-L6-v2 dimension
+
+if COLLECTION not in client.get_collections().collections:
+    client.recreate_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=DIM, distance=Distance.COSINE)
     )
-)
 
-### FASTAPI INIT
+# --- FASTAPI INIT ---
 app = FastAPI(title="LLM Clause Retrieval", version="1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_headers=["*"],
-    allow_methods=["*"]
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-### REQUEST SCHEMA
+# --- SCHEMA ---
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
 
-### DOCUMENT PARSERS
-def parse_pdf(path: str) -> str:
-    doc = fitz.open(path)
-    return "\n".join([p.get_text() for p in doc])
-
-def parse_docx(path: str) -> str:
-    doc = docx.Document(path)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-def parse_email(raw: str) -> str:
-    msg = message_from_string(raw)
-    return "\n".join(part.get_payload(decode=True).decode(errors='ignore')
-                     for part in msg.walk() if part.get_content_type() == "text/plain")
+# --- PARSERS ---
+def parse_pdf(path): return "\n".join([p.get_text() for p in fitz.open(path)])
+def parse_docx(path): return "\n".join([p.text for p in docx.Document(path).paragraphs])
+def parse_email(raw): return "\n".join(part.get_payload(decode=True).decode(errors='ignore')
+                                       for part in message_from_string(raw).walk()
+                                       if part.get_content_type() == "text/plain")
 
 def fetch_and_parse_document(url: str) -> str:
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to fetch document")
+    r = requests.get(url)
+    if r.status_code != 200:
+        raise HTTPException(400, "Failed to fetch")
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(r.content)
+        path = f.name
+    if url.endswith(".pdf"): return parse_pdf(path)
+    elif url.endswith(".docx"): return parse_docx(path)
+    elif url.endswith(".eml") or url.endswith(".msg"): return parse_email(r.text)
+    else: raise HTTPException(400, "Unsupported file type")
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+# --- CHUNK + STORE ---
+def chunk_text(text, size=300):
+    sents, out, cur = text.split(". "), [], ""
+    for s in sents:
+        if len(cur) + len(s) < size: cur += s + ". "
+        else: out.append(cur.strip()); cur = s + ". "
+    if cur: out.append(cur.strip())
+    return out
 
-    if url.endswith(".pdf"):
-        return parse_pdf(tmp_path)
-    elif url.endswith(".docx"):
-        return parse_docx(tmp_path)
-    elif url.endswith(".eml") or url.endswith(".msg"):
-        return parse_email(response.text)
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+def store_chunks(chunks: List[str]):
+    vectors = model.encode(chunks).tolist()
+    points = [PointStruct(id=i, vector=vectors[i], payload={"text": chunks[i]}) for i in range(len(chunks))]
+    client.upsert(COLLECTION, points=points)
 
-### CHUNKING
-def chunk_text(text: str, chunk_size: int = 300) -> List[str]:
-    sents = text.split(". ")
-    chunks, current = [], ""
-    for sent in sents:
-        if len(current) + len(sent) < chunk_size:
-            current += sent + ". "
-        else:
-            chunks.append(current.strip())
-            current = sent + ". "
-    if current:
-        chunks.append(current.strip())
-    return chunks
+def search_chunks(query: str, k=5) -> List[str]:
+    vec = model.encode(query).tolist()
+    res = client.search(collection_name=COLLECTION, query_vector=vec, limit=k)
+    return [r.payload["text"] for r in res]
 
-def insert_chunks(chunks: List[str]):
-    for i, chunk in enumerate(chunks):
-        collection.add(documents=[chunk], ids=[f"chunk-{i}"])
-
-def query_chunks(question: str, k: int = 5) -> List[str]:
-    result = collection.query(query_texts=[question], n_results=k)
-    return result["documents"][0]
-
-### PROMPTING & LLM
-def build_prompt(question: str, context: List[str]) -> str:
-    ctx = "\n---\n".join(context)
+# --- LLM CALL ---
+def build_prompt(question, context):
     return f"""
-You are an insurance policy assistant. Use the context below to answer the user query.
+Use the context below to answer the user query clearly and concisely.
 
 Context:
-{ctx}
+{"".join(context)}
 
 Question:
 {question}
 
-Respond with this format:
-{{"answer": "<your concise, explainable answer>"}}
+Respond only in JSON like:
+{{"answer": "<your answer>"}}
 """
 
 async def call_llm(prompt: str) -> str:
-    payload = {
+    headers = {"Content-Type": "application/json"}
+    body = {
         "model": "mistral",
         "prompt": prompt,
         "max_tokens": 512,
         "temperature": 0.2
     }
-    headers = {"Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        res = await client.post(LLM_API_URL, json=payload, headers=headers)
+    async with httpx.AsyncClient() as c:
+        res = await c.post(LLM_API_URL, headers=headers, json=body)
         res.raise_for_status()
-        return res.json()["choices"][0]["text"].strip()
+        return res.json()["choices"][0]["text"]
 
-### API ROUTE
+# --- API ---
 @app.post("/api/v1/hackrx/run")
-async def run_query(req: QueryRequest):
+async def run(req: QueryRequest):
     try:
-        full_text = fetch_and_parse_document(req.documents)
-        chunks = chunk_text(full_text)
-        insert_chunks(chunks)
+        doc_text = fetch_and_parse_document(req.documents)
+        chunks = chunk_text(doc_text)
+        store_chunks(chunks)
 
-        final_answers = []
-        for question in req.questions:
-            top_chunks = query_chunks(question)
-            prompt = build_prompt(question, top_chunks)
-            response_text = await call_llm(prompt)
+        answers = []
+        for q in req.questions:
+            ctx = search_chunks(q)
+            prompt = build_prompt(q, ctx)
+            result = await call_llm(prompt)
             try:
-                response_json = json.loads(response_text)
-                final_answers.append(response_json["answer"])
+                answers.append(json.loads(result)["answer"])
             except:
-                final_answers.append("Could not extract answer. Raw: " + response_text)
+                answers.append("Could not parse answer. Raw: " + result)
 
-        return {"answers": final_answers}
+        return {"answers": answers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-### MAIN
+# --- LOCAL RUN ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
